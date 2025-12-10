@@ -20,7 +20,7 @@ COPY_ONLY_SELECTED_TYPES = True
 ALLOWED_EXTENSIONS = {".jpeg", ".jpg", ".heic", ".png"}
 
 #Максимальный размер файлов, которые копируем (в мегабайтах) (0 - без ограничений)
-MAX_FILE_SIZE_MB = 0
+MAX_FILE_SIZE_MB = 50
 
 #создать .json файл со структурой каталогов и файлов внешнего носителя (да/нет)
 CREATE_JSON = True
