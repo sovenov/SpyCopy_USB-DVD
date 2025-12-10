@@ -20,7 +20,7 @@ COPY_ONLY_SELECTED_TYPES = True
 ALLOWED_EXTENSIONS = {".jpeg", ".jpg", ".heic", ".png"}
 
 #Максимальный размер файлов, которые копируем (в мегабайтах) (0 - без ограничений)
-MAX_FILE_SIZE_MB = 50
+MAX_FILE_SIZE_MB = 0
 
 #создать .json файл со структурой каталогов и файлов внешнего носителя (да/нет)
 CREATE_JSON = True
@@ -32,7 +32,6 @@ IGNORE_DIRS = {
 }
 # ==============================================================
 
-
 def base_dir():
     return os.path.dirname(sys.executable if getattr(sys, "frozen", False)
                            else os.path.abspath(__file__))
@@ -40,7 +39,6 @@ def base_dir():
 BASE = base_dir()
 CATALOGS = os.path.join(BASE, "catalogs")
 os.makedirs(CATALOGS, exist_ok=True)
-
 
 def win_label(path):
     p = path.rstrip("\\/")
@@ -70,7 +68,6 @@ def get_label(path):
     name = os.path.basename(path.rstrip("/"))
     return name.replace(" ", "_") or "NO_LABEL"
 
-
 def make_target_dir(label):
     now = datetime.now()
     ts = now.strftime("%Y-%m-%d_%H-%M-%S")
@@ -81,8 +78,7 @@ def make_target_dir(label):
     os.makedirs(path, exist_ok=True)
     return path, folder
 
-
-def scan_incremental(root, folder_name, json_done_event):
+def scan_incremental(root, folder_name, json_done_event, interrupted_event):
     struct = {"path": root, "folders": [], "files": []}
     json_root = os.path.join(CATALOGS, folder_name)
     last = 0
@@ -91,11 +87,18 @@ def scan_incremental(root, folder_name, json_done_event):
 
     def walk(path, out):
         nonlocal last, counter, prev_tmp
+        if interrupted_event.is_set() or not os.path.exists(root):
+            interrupted_event.set()
+            return
         try:
             entries = os.scandir(path)
         except:
+            interrupted_event.set()
             return
         for e in entries:
+            if interrupted_event.is_set() or not os.path.exists(root):
+                interrupted_event.set()
+                return
             name = e.name
             if name.startswith(".") or name in IGNORE_DIRS:
                 continue
@@ -115,34 +118,32 @@ def scan_incremental(root, folder_name, json_done_event):
                         json.dump(struct, f, ensure_ascii=False, indent=2)
                 except:
                     pass
-                if prev_tmp and os.path.exists(prev_tmp):
-                    try: os.remove(prev_tmp)
-                    except: pass
+                if prev_tmp and os.path.exists(prev_tmp) and prev_tmp != tmp_path:
+                    try:
+                        os.remove(prev_tmp)
+                    except:
+                        pass
                 prev_tmp = tmp_path
-            if not os.path.exists(root):
-                return
 
     walk(root, struct)
 
-    try:
-        if prev_tmp and os.path.exists(prev_tmp):
-            os.remove(prev_tmp)
-    except:
-        pass
-
-    final_path = os.path.join(json_root, f"{folder_name}.json")
-    try:
-        with open(final_path, "w", encoding="utf-8") as f:
-            json.dump(struct, f, ensure_ascii=False, indent=2)
-    except:
-        pass
+    if not interrupted_event.is_set():
+        try:
+            if prev_tmp and os.path.exists(prev_tmp):
+                os.remove(prev_tmp)
+        except:
+            pass
+        final_path = os.path.join(json_root, f"{folder_name}.json")
+        try:
+            with open(final_path, "w", encoding="utf-8") as f:
+                json.dump(struct, f, ensure_ascii=False, indent=2)
+        except:
+            pass
 
     json_done_event.set()
 
-
-def start_json_scan(root, folder_name, json_done_event):
-    threading.Thread(target=scan_incremental, args=(root, folder_name, json_done_event), daemon=True).start()
-
+def start_json_scan(root, folder_name, json_done_event, interrupted_event):
+    threading.Thread(target=scan_incremental, args=(root, folder_name, json_done_event, interrupted_event), daemon=True).start()
 
 def file_allowed(path):
     if MODE in (0, 1):
@@ -158,7 +159,6 @@ def file_allowed(path):
             return False
     return True
 
-
 def resolve_conflict(path):
     if not os.path.exists(path):
         return path
@@ -166,30 +166,38 @@ def resolve_conflict(path):
     timestamp_us = int(time.time() * 1_000_000)
     return f"{base}_{timestamp_us}{ext}"
 
-
 active = set()
 lock = threading.Lock()
 
-
-def copy_file_safe(src, dst):
+def copy_file_safe(src, dst, interrupted_event, mount):
+    if interrupted_event.is_set() or not os.path.exists(mount):
+        interrupted_event.set()
+        return
     dst = resolve_conflict(dst)
     try:
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy2(src, dst)
     except:
-        pass
-
+        interrupted_event.set()
 
 def copy_device(mount, label):
     target_dir, folder_name = make_target_dir(label)
     json_done_event = threading.Event()
+    interrupted_event = threading.Event()
 
     if CREATE_JSON:
-        start_json_scan(mount, folder_name, json_done_event)
+        start_json_scan(mount, folder_name, json_done_event, interrupted_event)
 
     if MODE == 0:
-        json_done_event.wait()
-        open(os.path.join(target_dir, "complete.txt"), "w").close()
+        if CREATE_JSON:
+            json_done_event.wait()
+        try:
+            if interrupted_event.is_set():
+                open(os.path.join(target_dir, "interrupted.txt"), "w").close()
+            else:
+                open(os.path.join(target_dir, "complete.txt"), "w").close()
+        except:
+            pass
         with lock:
             active.discard(mount)
         return
@@ -198,16 +206,25 @@ def copy_device(mount, label):
 
     try:
         for root, dirs, files in os.walk(mount, topdown=True):
+            if interrupted_event.is_set() or not os.path.exists(mount):
+                interrupted_event.set()
+                break
+
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in IGNORE_DIRS]
             rel = os.path.relpath(root, mount)
 
             if MODE in (1, 2):
                 dest_root = target_dir if rel == "." else os.path.join(target_dir, rel)
-                try: os.makedirs(dest_root, exist_ok=True)
-                except: pass
+                try:
+                    os.makedirs(dest_root, exist_ok=True)
+                except:
+                    pass
 
             if MODE in (2, 3):
                 for f in files:
+                    if interrupted_event.is_set() or not os.path.exists(mount):
+                        interrupted_event.set()
+                        break
                     if f.startswith(".") or f in IGNORE_DIRS:
                         continue
                     src = os.path.join(root, f)
@@ -217,21 +234,23 @@ def copy_device(mount, label):
                         dst = os.path.join(dest_root, f)
                     else:
                         dst = os.path.join(target_dir, f)
-                    executor.submit(copy_file_safe, src, dst)
+                    executor.submit(copy_file_safe, src, dst, interrupted_event, mount)
 
-            if not os.path.exists(mount):
+            if interrupted_event.is_set():
                 break
     finally:
         executor.shutdown(wait=True)
         if CREATE_JSON:
             json_done_event.wait()
         try:
-            open(os.path.join(target_dir, "complete.txt"), "w").close()
+            if interrupted_event.is_set():
+                open(os.path.join(target_dir, "interrupted.txt"), "w").close()
+            else:
+                open(os.path.join(target_dir, "complete.txt"), "w").close()
         except:
             pass
         with lock:
             active.discard(mount)
-
 
 def start_copy(mount):
     label = get_label(mount)
@@ -241,21 +260,22 @@ def start_copy(mount):
         active.add(mount)
     threading.Thread(target=copy_device, args=(mount, label), daemon=True).start()
 
-
 def list_disks():
     out = []
     for p in psutil.disk_partitions(all=True):
         mp = p.mountpoint
         opts = p.opts.lower()
         if "removable" in opts:
-            out.append(mp); continue
+            out.append(mp)
+            continue
         if mp.startswith("/media") or mp.startswith("/run/media") or mp.startswith("/Volumes"):
-            out.append(mp); continue
+            out.append(mp)
+            continue
         if platform.system() == "Windows":
-            if len(mp.replace("\\", "")) == 2:
+            m = mp.replace("\\", "")
+            if len(m) == 2:
                 out.append(mp)
     return out
-
 
 def main():
     seen = set()
@@ -276,6 +296,7 @@ def main():
         time.sleep(1)
         current = set(list_disks())
         new = current - seen
+
         for d in new:
             removable = False
             opts = ""
@@ -293,7 +314,6 @@ def main():
                 initial_local.remove(d)
 
         seen = current
-
 
 if __name__ == "__main__":
     main()
