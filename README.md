@@ -33,10 +33,10 @@
 
 2.  **Собрать проект**
     ```bash
-    pyinstaller --noconsole --onefile usb_copy_monitor.py
+    pyinstaller --noconsole --onefile main.py
     ```
 
-После сборки исполняемый файл будет находиться здесь: `dist/usb_copy_monitor.exe`
+После сборки исполняемый файл будет находиться здесь: `dist/main.exe`
 
 ---
 
