@@ -32,6 +32,7 @@ IGNORE_DIRS = {
 }
 # ==============================================================
 
+
 def base_dir():
     return os.path.dirname(sys.executable if getattr(sys, "frozen", False)
                            else os.path.abspath(__file__))
@@ -40,32 +41,35 @@ BASE = base_dir()
 CATALOGS = os.path.join(BASE, "catalogs")
 os.makedirs(CATALOGS, exist_ok=True)
 
+
 def win_label(path):
-    try:
-        p = path.rstrip("\\/")
-        vol = ctypes.create_unicode_buffer(1024)
-        fs = ctypes.create_unicode_buffer(1024)
-        s = ctypes.wintypes.DWORD()
-        m = ctypes.wintypes.DWORD()
-        f = ctypes.wintypes.DWORD()
-        ok = ctypes.windll.kernel32.GetVolumeInformationW(
-            p + "\\", vol, 1024, ctypes.byref(s),
-            ctypes.byref(m), ctypes.byref(f), fs, 1024
-        )
-        if ok:
-            return vol.value.strip()
-    except:
-        pass
-    return ""
+    p = path.rstrip("\\/")
+    for _ in range(3):
+        try:
+            vol = ctypes.create_unicode_buffer(1024)
+            fs = ctypes.create_unicode_buffer(1024)
+            s = ctypes.wintypes.DWORD()
+            m = ctypes.wintypes.DWORD()
+            f = ctypes.wintypes.DWORD()
+            ok = ctypes.windll.kernel32.GetVolumeInformationW(
+                p + "\\", vol, 1024, ctypes.byref(s),
+                ctypes.byref(m), ctypes.byref(f), fs, 1024
+            )
+            if ok and vol.value.strip():
+                return vol.value.strip()
+        except:
+            pass
+        time.sleep(0.2)
+    letter = p.replace(":", "").replace("\\", "")
+    return f"Disk{letter}"
 
 def get_label(path):
     if platform.system() == "Windows":
         lab = win_label(path)
-        if not lab:
-            lab = path.rstrip("\\").replace(":", "")
-        return lab.replace(" ", "_") or "NO_LABEL"
+        return lab.replace(" ", "_")
     name = os.path.basename(path.rstrip("/"))
     return name.replace(" ", "_") or "NO_LABEL"
+
 
 def make_target_dir(label):
     now = datetime.now()
@@ -76,6 +80,7 @@ def make_target_dir(label):
     path = os.path.join(CATALOGS, folder)
     os.makedirs(path, exist_ok=True)
     return path, folder
+
 
 def scan_incremental(root, folder_name, json_done_event):
     struct = {"path": root, "folders": [], "files": []}
@@ -104,8 +109,7 @@ def scan_incremental(root, folder_name, json_done_event):
             if time.time() - last > 1:
                 last = time.time()
                 counter += 1
-                tmp_name = f"{folder_name}_{counter}.json"
-                tmp_path = os.path.join(json_root, tmp_name)
+                tmp_path = os.path.join(json_root, f"{folder_name}_{counter}.json")
                 try:
                     with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(struct, f, ensure_ascii=False, indent=2)
@@ -126,8 +130,7 @@ def scan_incremental(root, folder_name, json_done_event):
     except:
         pass
 
-    final_name = f"{folder_name}.json"
-    final_path = os.path.join(json_root, final_name)
+    final_path = os.path.join(json_root, f"{folder_name}.json")
     try:
         with open(final_path, "w", encoding="utf-8") as f:
             json.dump(struct, f, ensure_ascii=False, indent=2)
@@ -136,8 +139,10 @@ def scan_incremental(root, folder_name, json_done_event):
 
     json_done_event.set()
 
+
 def start_json_scan(root, folder_name, json_done_event):
     threading.Thread(target=scan_incremental, args=(root, folder_name, json_done_event), daemon=True).start()
+
 
 def file_allowed(path):
     if MODE in (0, 1):
@@ -153,14 +158,35 @@ def file_allowed(path):
             return False
     return True
 
+
+def resolve_conflict(path):
+    if not os.path.exists(path):
+        return path
+    base, ext = os.path.splitext(path)
+    timestamp_us = int(time.time() * 1_000_000)
+    return f"{base}_{timestamp_us}{ext}"
+
+
 active = set()
 lock = threading.Lock()
+
+
+def copy_file_safe(src, dst):
+    dst = resolve_conflict(dst)
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy2(src, dst)
+    except:
+        pass
+
 
 def copy_device(mount, label):
     target_dir, folder_name = make_target_dir(label)
     json_done_event = threading.Event()
+
     if CREATE_JSON:
         start_json_scan(mount, folder_name, json_done_event)
+
     if MODE == 0:
         json_done_event.wait()
         open(os.path.join(target_dir, "complete.txt"), "w").close()
@@ -191,7 +217,7 @@ def copy_device(mount, label):
                         dst = os.path.join(dest_root, f)
                     else:
                         dst = os.path.join(target_dir, f)
-                    executor.submit(shutil.copy2, src, dst)
+                    executor.submit(copy_file_safe, src, dst)
 
             if not os.path.exists(mount):
                 break
@@ -206,6 +232,7 @@ def copy_device(mount, label):
         with lock:
             active.discard(mount)
 
+
 def start_copy(mount):
     label = get_label(mount)
     with lock:
@@ -213,6 +240,7 @@ def start_copy(mount):
             return
         active.add(mount)
     threading.Thread(target=copy_device, args=(mount, label), daemon=True).start()
+
 
 def list_disks():
     out = []
@@ -224,10 +252,10 @@ def list_disks():
         if mp.startswith("/media") or mp.startswith("/run/media") or mp.startswith("/Volumes"):
             out.append(mp); continue
         if platform.system() == "Windows":
-            m = mp.replace("\\", "")
-            if len(m) == 2 and m[1] == ":":
+            if len(mp.replace("\\", "")) == 2:
                 out.append(mp)
     return out
+
 
 def main():
     seen = set()
@@ -248,7 +276,6 @@ def main():
         time.sleep(1)
         current = set(list_disks())
         new = current - seen
-
         for d in new:
             removable = False
             opts = ""
@@ -266,6 +293,7 @@ def main():
                 initial_local.remove(d)
 
         seen = current
+
 
 if __name__ == "__main__":
     main()
