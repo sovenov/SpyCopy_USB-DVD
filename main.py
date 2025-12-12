@@ -30,6 +30,9 @@ IGNORE_DIRS = {
     "System Volume Information",
     "MSOCache"
 }
+
+#игнорировать сетевые, виртуальные, iscsi, fuse, iso и прочие "левые" диски (да/нет)
+IGNORE_NON_PHYSICAL = True
 # ==============================================================
 
 def base_dir():
@@ -39,6 +42,8 @@ def base_dir():
 BASE = base_dir()
 CATALOGS = os.path.join(BASE, "catalogs")
 os.makedirs(CATALOGS, exist_ok=True)
+active = set()
+lock = threading.Lock()
 
 def win_label(path):
     p = path.rstrip("\\/")
@@ -166,9 +171,6 @@ def resolve_conflict(path):
     timestamp_us = int(time.time() * 1_000_000)
     return f"{base}_{timestamp_us}{ext}"
 
-active = set()
-lock = threading.Lock()
-
 def copy_file_safe(src, dst, interrupted_event, mount):
     if interrupted_event.is_set() or not os.path.exists(mount):
         interrupted_event.set()
@@ -262,19 +264,56 @@ def start_copy(mount):
 
 def list_disks():
     out = []
+
+    network_fs = {
+        "cifs", "smbfs", "nfs", "afpfs", "sshfs", "fuse.sshfs",
+        "webdav", "davfs", "s3fs", "gcsfuse"
+    }
+
+    virtual_fs = {
+        "tmpfs", "devtmpfs", "ramfs", "squashfs", "overlay",
+        "fuseblk", "fuse", "fuse.lxcfs", "fuse.gvfsd-fuse",
+        "fuse.rclone", "fuse.encfs", "fuse.zip"
+    }
+
+    forbidden_keywords = {
+        "iscsi", "vhd", "vhdx", "veracrypt", "truecrypt",
+        "bitlocker", "virtual", "vbox", "vmware", "qemu",
+        "iso", "dvdroot", "cdroot", "snap"
+    }
+
     for p in psutil.disk_partitions(all=True):
         mp = p.mountpoint
         opts = p.opts.lower()
+        fstype = p.fstype.lower()
+        device = p.device.lower()
+
+        if "remote" in opts:
+            continue
+
+        if IGNORE_NON_PHYSICAL:
+            if fstype in network_fs or fstype in virtual_fs:
+                continue
+            if any(k in device for k in forbidden_keywords):
+                continue
+            if any(k in fstype for k in forbidden_keywords):
+                continue
+            if any(k in opts for k in forbidden_keywords):
+                continue
+
         if "removable" in opts:
             out.append(mp)
             continue
-        if mp.startswith("/media") or mp.startswith("/run/media") or mp.startswith("/Volumes"):
+
+        if mp.startswith("/media") or mp.startswith("/run/media") or mp.startswith("/mnt") or mp.startswith("/Volumes"):
             out.append(mp)
             continue
+
         if platform.system() == "Windows":
             m = mp.replace("\\", "")
-            if len(m) == 2:
+            if len(m) == 2 and m[1] == ":":
                 out.append(mp)
+
     return out
 
 def main():
